@@ -17,7 +17,7 @@ type Job struct {
 }
 type ServerInformation struct {
 	Address     string    // address of the server
-	Jobs        []Job     // queue of jobs (we are batching queries)
+	Jobs        []Job     // queue of jobs (we are batching queries) might need another set of queue to store currently executing jobs (They can fail so they might require rebalancing after some time)
 	LastUpdated time.Time // last healthcheck time. Stored in UTC
 	SendJob     bool      // should you send a job here (may have crashed or something)
 }
@@ -78,7 +78,7 @@ func (server *CoordinationServer) Register(workerAddr string, reply *int) error 
 
 		if server.Hasher[hashed].Address == "" {
 			*reply = hashed
-
+			fmt.Println("The server is being placed on ", hashed)
 			server.Hasher[hashed].Address = workerAddr
 			server.Hasher[hashed].SendJob = true
 			server.Hasher[hashed].LastUpdated = time.Now().UTC()
@@ -114,21 +114,23 @@ func (server *CoordinationServer) Healthcheck(workerId int, reply *int) error {
 
 // does this have to have server *CoordinationServer?
 // this is when you react to user http input
-func (server *CoordinationServer) FulfillRequest(fileName string, reply *int) error {
+func (server *CoordinationServer) FulfillRequest(fileName string) error {
 
 	count := 0
 	position := hash(fileName, server.Servers)
+	// fmt.Println("Length is ", len(server.Hasher))
 	for {
-
+		fmt.Println("The request is being sent from the user to position ", position)
 		if server.Hasher[position].SendJob {
 			server.Hasher[position].Jobs = append(server.Hasher[position].Jobs, Job{Filename: fileName})
+			fmt.Printf("Address %v has %v\n", server.Hasher[position].Address, server.Hasher[position].Jobs)
 			return nil
 		} else {
 			if count == server.Servers {
 				return errors.New("no slot found")
 			}
 		}
-		position++
+		position = (position + 1) % server.Servers
 		count++
 
 	}
@@ -137,8 +139,14 @@ func (server *CoordinationServer) FulfillRequest(fileName string, reply *int) er
 
 func (server *CoordinationServer) RequestJobs(workerAddress string, reply *[]Job) error {
 	hashed := hash(workerAddress, server.Servers)
-	jQueue := make([]Job, len(server.Hasher[hashed].Jobs))
-	*reply = jQueue
+	server.mu.Lock()
+	nJobs := len(server.Hasher[hashed].Jobs)
+	if nJobs > 0 && nJobs%3 == 0 {
+		jQueue := server.Hasher[hashed].Jobs
+		server.Hasher[hashed].Jobs = []Job{}
+		*reply = jQueue
+	}
+	server.mu.Unlock()
 	// yo wala should be the same as registration function?
 	return nil
 }
@@ -169,11 +177,12 @@ func (server *CoordinationServer) rebalanceQueues() {
 						}
 						// remove from this array and distribute half to key - 1 and distribute the rest to key + 1
 
-						leftServer := key - 1
+						leftServer := (key - 1 + server.Servers) % server.Servers
 
 						for {
 
 							if leftServer == key {
+								// no server found
 								break
 							}
 
@@ -185,7 +194,7 @@ func (server *CoordinationServer) rebalanceQueues() {
 
 						}
 
-						rightServer := key + 1
+						rightServer := (key + 1) % server.Servers
 
 						for {
 
